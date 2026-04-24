@@ -5,6 +5,8 @@ import sqlite3
 import pdfplumber
 from datetime import datetime
 import requests
+import base64
+import re
 
 # ─────────────────────────────────────────────
 # 1. CONFIG
@@ -20,6 +22,11 @@ os.makedirs(POLICY_FOLDER, exist_ok=True)
 Z_AI_API_KEY   = "os.environ.get("Z_AI_API_KEY", "")"
 CUSTOM_BASE_URL = "https://api.ilmu.ai/v1"
 MODEL_NAME      = "ilmu-glm-5.1"
+
+# ── Groq Vision API (for Wastage Identify) ───
+GROQ_API_KEY    = "os.environ.get("GROQ_API_KEY", "")"
+GROQ_BASE_URL   = "https://api.groq.com/openai/v1"
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # ── Malaysian Carbon Tax Constants ───────────
 CARBON_TAX_RATE_RM    = 15.0
@@ -194,6 +201,90 @@ Return ONLY a JSON object (no explanation, no markdown):
         raw = resp.json()["choices"][0]["message"]["content"]
         raw = raw.strip().replace("```json","").replace("```","").strip()
         return json.loads(raw)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def identify_wastage_with_ai(image_file) -> dict:
+    """Use Groq vision AI to identify waste type and estimate weight from an uploaded image."""
+    try:
+        img_bytes = image_file.getvalue()
+        if not img_bytes:
+            img_bytes = image_file.read()
+        b64_img = base64.b64encode(img_bytes).decode("utf-8")
+        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                    "webp": "image/webp", "gif": "image/gif"}
+        ext = image_file.name.rsplit(".", 1)[-1].lower()
+        mime = mime_map.get(ext, "image/jpeg")
+
+        prompt = """You are a waste identification and weight estimation expert for a Malaysian manufacturing plant.
+
+Analyze the image of waste material and return ONLY a JSON object with these fields (no explanation, no markdown):
+{
+  "waste_type": "One of: solid_waste, scrap_metal, general_waste, wastewater",
+  "waste_type_label": "Human-readable label e.g. Solid Waste, Scrap Metal, General Waste, Wastewater",
+  "estimated_weight_kg": <estimated weight in kg as a number>,
+  "confidence_percent": <integer from 0 to 100 representing how confident you are>,
+  "description": "Brief description of what you see",
+  "material_details": "Specific materials identified",
+  "estimation_reasoning": "How you arrived at the weight estimate"
+}
+
+Be conservative with weight estimates. The confidence_percent must be an integer 0-100."""
+
+        resp = requests.post(
+            f"{GROQ_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_VISION_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_img}"}}
+                    ]
+                }],
+                "temperature": 0.1,
+                "max_tokens": 400
+            },
+            timeout=60)
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"]
+
+        # Robust JSON extraction
+        raw = raw.strip()
+        raw = re.sub(r"```(?:json)?\s*", "", raw)
+        raw = raw.replace("```", "")
+        match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+        raw = raw.strip()
+
+        result = json.loads(raw)
+
+        # Validate expected fields
+        for field in ["waste_type", "estimated_weight_kg"]:
+            if field not in result:
+                result[field] = "general_waste" if field == "waste_type" else 0
+        if "confidence_percent" not in result:
+            result["confidence_percent"] = 50
+
+        try:
+            result["estimated_weight_kg"] = float(result["estimated_weight_kg"])
+        except (ValueError, TypeError):
+            result["estimated_weight_kg"] = 0
+
+        try:
+            result["confidence_percent"] = int(result["confidence_percent"])
+        except (ValueError, TypeError):
+            result["confidence_percent"] = 50
+        result["confidence_percent"] = max(0, min(100, result["confidence_percent"]))
+
+        return result
+    except json.JSONDecodeError:
+        return {"error": f"AI returned invalid JSON. Raw: {raw[:200]}. Try again or enter manually."}
+    except requests.exceptions.HTTPError:
+        return {"error": f"HTTP Error {resp.status_code}: {resp.text}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -555,17 +646,88 @@ def render_carbon_calculator():
             st.caption("No supplier trips logged yet. Log a trip above to start comparing.")
 
     # ════════════════════════════════════════
+    # WASTAGE IDENTIFY (Groq Vision AI)
+    # ════════════════════════════════════════
+    for wk, wv in [("waste_solid_kg", 0.0), ("waste_scrap_kg", 0.0),
+                    ("waste_ww_m3", 0.0), ("waste_general_kg", 0.0)]:
+        if wk not in st.session_state:
+            st.session_state[wk] = wv
+
+    with st.expander("🔍 WASTAGE IDENTIFY — AI Vision Weight Estimator", expanded=False):
+        st.markdown("**Upload a photo of waste and AI will identify the type & estimate the weight.**")
+        st.caption("Powered by Groq Llama 3.2 Vision. Supports JPG, PNG, WEBP images.")
+
+        waste_img = st.file_uploader(
+            "📸 Upload waste photo",
+            type=["jpg", "jpeg", "png", "webp", "gif"],
+            key="waste_image_uploader"
+        )
+
+        if waste_img:
+            st.image(waste_img, caption="Uploaded waste image", use_container_width=True)
+
+        if st.button("🤖 Identify Wastage with AI", key="identify_waste_btn"):
+            if waste_img:
+                with st.spinner("Groq AI is analysing the waste image..."):
+                    result = identify_wastage_with_ai(waste_img)
+                if "error" not in result:
+                    st.session_state["waste_ai_result"] = result
+
+                    waste_type = result.get("waste_type", "general_waste")
+                    weight = float(result.get("estimated_weight_kg", 0))
+                    confidence = result.get("confidence_percent", 50)
+                    description = result.get("description", "—")
+                    details = result.get("material_details", "—")
+                    label = result.get("waste_type_label", "Unknown")
+
+                    if waste_type == "solid_waste":
+                        st.session_state.waste_solid_kg = weight
+                    elif waste_type == "scrap_metal":
+                        st.session_state.waste_scrap_kg = weight
+                    elif waste_type == "wastewater":
+                        st.session_state.waste_ww_m3 = weight
+                    else:
+                        st.session_state.waste_general_kg = weight
+
+                    conf_color = "green" if confidence >= 70 else "orange" if confidence >= 40 else "red"
+                    st.success(f"✅ Identified: **{label}** — estimated **{weight:.1f} kg**")
+                    st.markdown(f"**Confidence:** :{conf_color}[**{confidence}%**]")
+                    st.info(f"**Description:** {description}\n\n**Materials:** {details}")
+
+                    if confidence < 40:
+                        st.warning("⚠️ Low confidence — please verify the weight manually.")
+                else:
+                    st.error(f"❌ {result['error']}")
+            else:
+                st.warning("Please upload a waste image first.")
+
+        if "waste_ai_result" in st.session_state:
+            r = st.session_state["waste_ai_result"]
+            with st.container():
+                st.markdown("**📋 Last AI Identification:**")
+                st.markdown(f"- **Type:** {r.get('waste_type_label', '—')}")
+                st.markdown(f"- **Estimated Weight:** {r.get('estimated_weight_kg', 0)} kg")
+                conf = r.get('confidence_percent', 50)
+                conf_color = "green" if conf >= 70 else "orange" if conf >= 40 else "red"
+                st.markdown(f"- **Confidence:** :{conf_color}[**{conf}%**]")
+                st.markdown(f"- **Details:** {r.get('material_details', '—')}")
+
+    # ════════════════════════════════════════
     # WASTE
     # ════════════════════════════════════════
     with st.expander("⚫ WASTE EMISSIONS (All Types)", expanded=True):
         st.caption("Emission factors: Solid 0.5 | Wastewater 0.42/m³ | Scrap metal 1.46 | General 0.5 kg CO₂e/kg")
         c1, c2 = st.columns(2)
         with c1:
-            solid_kg   = st.number_input("🗑️ Solid waste (kg)",           min_value=0.0, step=1.0, key="sw")
-            scrap_kg   = st.number_input("🔩 Scrap / off-cut metal (kg)", min_value=0.0, step=1.0, key="sm")
+            solid_kg   = st.number_input("🗑️ Solid waste (kg)",           min_value=0.0,
+                            value=st.session_state.waste_solid_kg, step=1.0, key="sw")
+            scrap_kg   = st.number_input("🔩 Scrap / off-cut metal (kg)", min_value=0.0,
+                            value=st.session_state.waste_scrap_kg, step=1.0, key="sm")
         with c2:
-            ww_m3      = st.number_input("💧 Wastewater (m³)",            min_value=0.0, step=0.1, key="ww")
-            general_kg = st.number_input("📦 General / other waste (kg)", min_value=0.0, step=1.0, key="gw")
+            ww_m3      = st.number_input("💧 Wastewater (m³)",            min_value=0.0,
+                            value=st.session_state.waste_ww_m3, step=0.1, key="ww")
+            general_kg = st.number_input("📦 General / other waste (kg)", min_value=0.0,
+                            value=st.session_state.waste_general_kg, step=1.0, key="gw")
 
         st.text_area("📝 Other waste (describe — for record keeping)",
             placeholder="e.g. Chemical solvent 20L, Packaging foam 50kg …", key="custom_waste")
@@ -713,7 +875,8 @@ data = load_data()
 for key, default in [
     ("user", None), ("role", None),
     ("show_report", False), ("current_report", ""),
-    ("show_policy", False), ("show_carbon", False)
+    ("show_policy", False), ("show_carbon", False),
+    ("show_wastage", False)
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -754,6 +917,14 @@ with st.sidebar:
         st.session_state.show_carbon = True
         st.session_state.show_report = False
         st.session_state.show_policy = False
+        st.session_state.show_wastage = False
+        st.rerun()
+
+    if st.button("🔍 Wastage Identify", use_container_width=True):
+        st.session_state.show_wastage = True
+        st.session_state.show_carbon = False
+        st.session_state.show_report = False
+        st.session_state.show_policy = False
         st.rerun()
 
     if st.session_state.role == "CEO":
@@ -769,6 +940,7 @@ with st.sidebar:
                 st.session_state.show_report = True
                 st.session_state.show_policy = False
                 st.session_state.show_carbon = False
+                st.session_state.show_wastage = False
             st.rerun()
 
         st.divider()
@@ -777,6 +949,7 @@ with st.sidebar:
             st.session_state.show_policy = True
             st.session_state.show_report = False
             st.session_state.show_carbon = False
+            st.session_state.show_wastage = False
             st.rerun()
 
         st.divider()
@@ -804,6 +977,104 @@ with st.sidebar:
 # VIEW A — Carbon Calculator (CEO + Manager)
 if st.session_state.show_carbon:
     render_carbon_calculator()
+
+# VIEW A2 — Wastage Identify (CEO + Manager)
+elif st.session_state.show_wastage:
+    st.title("🔍 Wastage Identify — AI Vision Weight Estimator")
+    st.caption("Upload a photo of waste and Groq AI will identify the type & estimate the weight.")
+
+    if st.button("← Back to Chat"):
+        st.session_state.show_wastage = False
+        st.rerun()
+
+    st.divider()
+
+    for wk, wv in [("waste_solid_kg", 0.0), ("waste_scrap_kg", 0.0),
+                    ("waste_ww_m3", 0.0), ("waste_general_kg", 0.0)]:
+        if wk not in st.session_state:
+            st.session_state[wk] = wv
+
+    waste_img = st.file_uploader(
+        "📸 Upload waste photo",
+        type=["jpg", "jpeg", "png", "webp", "gif"],
+        key="waste_img_standalone"
+    )
+
+    if waste_img:
+        st.image(waste_img, caption="Uploaded waste image", use_container_width=True)
+
+    if st.button("🤖 Identify Wastage with AI", key="identify_waste_standalone", use_container_width=True, type="primary"):
+        if waste_img:
+            with st.spinner("Groq AI is analysing the waste image..."):
+                result = identify_wastage_with_ai(waste_img)
+            if "error" not in result:
+                st.session_state["waste_ai_result"] = result
+
+                waste_type = result.get("waste_type", "general_waste")
+                weight = float(result.get("estimated_weight_kg", 0))
+                confidence = result.get("confidence_percent", 50)
+                description = result.get("description", "—")
+                details = result.get("material_details", "—")
+                label = result.get("waste_type_label", "Unknown")
+                reasoning = result.get("estimation_reasoning", "—")
+
+                if waste_type == "solid_waste":
+                    st.session_state.waste_solid_kg = weight
+                elif waste_type == "scrap_metal":
+                    st.session_state.waste_scrap_kg = weight
+                elif waste_type == "wastewater":
+                    st.session_state.waste_ww_m3 = weight
+                else:
+                    st.session_state.waste_general_kg = weight
+
+                conf_color = "green" if confidence >= 70 else "orange" if confidence >= 40 else "red"
+                st.success(f"✅ Identified: **{label}** — estimated **{weight:.1f} kg**")
+                st.markdown(f"**Confidence:** :{conf_color}[**{confidence}%**]")
+                st.info(f"**Description:** {description}\n\n**Materials:** {details}\n\n**Reasoning:** {reasoning}")
+
+                if confidence < 40:
+                    st.warning("⚠️ Low confidence — please verify the weight manually.")
+
+                # Calculate carbon impact
+                ef_key = {
+                    "solid_waste": "solid_waste_kg",
+                    "scrap_metal": "scrap_metal_kg",
+                    "wastewater": "wastewater_m3",
+                    "general_waste": "general_waste_kg",
+                }.get(waste_type, "general_waste_kg")
+                co2e_kg = weight * EF[ef_key]
+                tax_rm = (co2e_kg / 1000) * CARBON_TAX_RATE_RM
+
+                st.divider()
+                st.subheader("📊 Carbon Impact Estimate")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Estimated Weight", f"{weight:.1f} kg")
+                c2.metric("CO₂e Emissions", f"{co2e_kg:.2f} kg ({co2e_kg/1000:.4f} t)")
+                c3.metric("Carbon Tax Cost", f"RM {tax_rm:.2f}")
+            else:
+                st.error(f"❌ {result['error']}")
+        else:
+            st.warning("Please upload a waste image first.")
+
+    # Show last AI result
+    if "waste_ai_result" in st.session_state:
+        r = st.session_state["waste_ai_result"]
+        st.divider()
+        st.subheader("📋 Last AI Identification")
+        st.markdown(f"- **Type:** {r.get('waste_type_label', '—')}")
+        st.markdown(f"- **Estimated Weight:** {r.get('estimated_weight_kg', 0)} kg")
+        conf = r.get('confidence_percent', 50)
+        conf_color = "green" if conf >= 70 else "orange" if conf >= 40 else "red"
+        st.markdown(f"- **Confidence:** :{conf_color}[**{conf}%**]")
+        st.markdown(f"- **Description:** {r.get('description', '—')}")
+        st.markdown(f"- **Materials:** {r.get('material_details', '—')}")
+
+    # Link to Carbon Tax Calculator
+    st.divider()
+    if st.button("🌿 Open Carbon Tax Calculator to apply wastage data", use_container_width=True):
+        st.session_state.show_carbon = True
+        st.session_state.show_wastage = False
+        st.rerun()
 
 # VIEW B — Policy Upload (CEO only)
 elif st.session_state.show_policy and st.session_state.role == "CEO":
