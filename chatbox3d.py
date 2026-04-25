@@ -181,38 +181,72 @@ def regenerate_full_dataset() -> str:
     return msg
 
 
-def extract_receipt_with_ai(pdf_file, receipt_type: str) -> dict:
-    text_content = ""
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text_content += t + "\n"
-    if not text_content.strip():
-        return {"error": "Could not extract text from PDF."}
-
-    prompt = f"""Extract numerical data from this {receipt_type} receipt.
-
-RECEIPT TEXT:
-{text_content[:3000]}
-
-Return ONLY a JSON object (no explanation, no markdown):
-- Petrol/fuel: {{"litres": <number>, "fuel_type": "petrol or diesel", "amount_rm": <number>}}
-- Electricity: {{"kwh": <number>, "amount_rm": <number>, "period": "<month year>"}}
-- Logistics:   {{"distance_km": <number>, "fuel_litres": <number>, "amount_rm": <number>}}"""
-
+def extract_receipt_with_vision(image_file, receipt_type: str) -> dict:
+    """
+    Send receipt image directly to Groq Vision AI for extraction.
+    Accepts JPG, PNG, WEBP. Much more reliable than PDF OCR for scanned receipts.
+    """
     try:
+        image_file.seek(0)
+        img_bytes = image_file.read()
+        b64_img = base64.b64encode(img_bytes).decode("utf-8")
+        ext = image_file.name.rsplit(".", 1)[-1].lower()
+        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "png": "image/png", "webp": "image/webp"}
+        mime = mime_map.get(ext, "image/jpeg")
+
+        if receipt_type in ("petrol fuel", "diesel fuel"):
+            fields = '{"litres": <number>, "fuel_type": "petrol or diesel", "amount_rm": <number>}'
+        elif receipt_type == "electricity bill":
+            fields = '{"kwh": <number>, "amount_rm": <number>, "period": "<month year>"}'
+        else:
+            fields = '{"distance_km": <number>, "fuel_litres": <number>, "amount_rm": <number>}'
+
+        prompt = f"""You are a receipt data extraction expert.
+
+Look at this {receipt_type} receipt image carefully and extract the numerical data.
+
+Return ONLY a valid JSON object with no explanation and no markdown:
+{fields}
+
+Rules:
+- Read all numbers carefully from the receipt
+- For fuel receipts: find the total LITRES or QUANTITY purchased
+- For electricity: find the total kWh consumption
+- For logistics: find distance in km and fuel litres
+- If a value is not on the receipt, use 0
+- Return ONLY the JSON, nothing else"""
+
         resp = requests.post(
-            f"{CUSTOM_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {Z_AI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": MODEL_NAME,
-                  "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0.1, "max_tokens": 200},
-            timeout=30)
+            f"{GROQ_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_VISION_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_img}"}}
+                    ]
+                }],
+                "temperature": 0.1,
+                "max_tokens": 200
+            },
+            timeout=30
+        )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"]
-        raw = raw.strip().replace("```json","").replace("```","").strip()
+        raw = raw.strip()
+        raw = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+        match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
         return json.loads(raw)
+
+    except requests.exceptions.HTTPError as e:
+        return {"error": f"Groq API error {resp.status_code}: {resp.text}"}
+    except json.JSONDecodeError:
+        return {"error": f"AI returned invalid JSON. Raw response: {raw[:200]}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -716,13 +750,38 @@ def render_carbon_calculator():
 
     st.divider()
 
-    # ── Session state defaults for widget keys ───────
-    for k, v in [("petrol_l_in", 0.0), ("diesel_l_in", 0.0), ("lpg_kg_in", 0.0),
-                 ("kwh_in", 0.0), ("log_km_in", 0.0), ("log_diesel_in", 0.0),
-                 ("sw", 0.0), ("sm", 0.0), ("ww", 0.0), ("gw", 0.0),
-                 ("offset_t", 0.0)]:
+    # ── Session state for extracted values ───────
+    for k, v in [("s1_petrol_l", 0.0), ("s1_diesel_l", 0.0),
+                 ("s2_kwh", 0.0), ("s3_km", 0.0), ("s3_log_fuel", 0.0)]:
         if k not in st.session_state:
             st.session_state[k] = v
+
+    # Form key — increments on Clear to force widget re-render
+    fk = st.session_state.get("calc_form_key", 0)
+
+    # Sync extracted values into widget keys so number_inputs pick them up on rerun
+    # Streamlit number_input uses its key in session_state; if key exists, it ignores value=
+    for src, dst in [("s1_petrol_l", f"petrol_l_in_{fk}"),
+                     ("s1_diesel_l", f"diesel_l_in_{fk}"),
+                     ("s2_kwh",      f"kwh_in_{fk}"),
+                     ("s3_km",       f"log_km_in_{fk}"),
+                     ("s3_log_fuel", f"log_diesel_in_{fk}"),
+                     ("waste_solid_kg",   f"sw_{fk}"),
+                     ("waste_scrap_kg",   f"sm_{fk}"),
+                     ("waste_ww_m3",      f"ww_{fk}"),
+                     ("waste_general_kg", f"gw_{fk}")]:
+        if src in st.session_state and dst in st.session_state:
+            st.session_state[dst] = st.session_state[src]
+
+    # Show extraction success toasts after rerun
+    if st.session_state.pop("_toast_petrol", None):
+        st.toast(f"✅ {st.session_state.s1_petrol_l}L petrol extracted", icon="⛽")
+    if st.session_state.pop("_toast_diesel", None):
+        st.toast(f"✅ {st.session_state.s1_diesel_l}L diesel extracted", icon="⛽")
+    if st.session_state.pop("_toast_elec", None):
+        st.toast(f"✅ {st.session_state.s2_kwh} kWh extracted", icon="⚡")
+    if st.session_state.pop("_toast_logistics", None):
+        st.toast(f"✅ {st.session_state.s3_km}km / {st.session_state.s3_log_fuel}L extracted", icon="🚛")
 
     # ════════════════════════════════════════
     # SCOPE 1 — Direct (Fuel)
@@ -730,41 +789,55 @@ def render_carbon_calculator():
     with st.expander("🔴 SCOPE 1 — Direct Emissions (Company Vehicles & Fuel)", expanded=True):
         col1, col2 = st.columns(2)
         with col1:
-            petrol_pdf = st.file_uploader("🧾 Petrol Receipt (PDF)", type="pdf", key="petrol_pdf")
+            petrol_img = st.file_uploader("🧾 Petrol Receipt (JPG/PNG)", type=["jpg","jpeg","png","webp"], key="petrol_img")
+            if petrol_img:
+                st.image(petrol_img, caption="Petrol receipt preview", use_container_width=True)
             if st.button("Extract Petrol Receipt", key="ext_petrol"):
-                if petrol_pdf:
-                    with st.spinner("Extracting..."):
-                        ext = extract_receipt_with_ai(petrol_pdf, "petrol fuel")
+                if petrol_img:
+                    with st.spinner("Reading receipt with AI vision..."):
+                        ext = extract_receipt_with_vision(petrol_img, "petrol fuel")
                     if "error" not in ext:
-                        st.session_state.s1_petrol_l = float(ext.get("litres") or 0)
-                        st.success(f"✅ {st.session_state.s1_petrol_l}L extracted")
+                        litres = float(ext.get("litres") or 0)
+                        fuel_type = str(ext.get("fuel_type", "petrol")).lower()
+                        if "diesel" in fuel_type:
+                            st.session_state.s1_diesel_l = litres
+                            st.session_state.s1_petrol_l = 0.0
+                            st.session_state["_toast_diesel"] = True
+                        else:
+                            st.session_state.s1_petrol_l = litres
+                            st.session_state["_toast_petrol"] = True
+                        st.rerun()
                     else:
-                        st.warning(f"Auto-extract failed: {ext['error']}. Enter manually.")
+                        st.warning(f"Extraction failed: {ext['error']}. Enter manually.")
                 else:
-                    st.warning("Upload PDF first.")
+                    st.warning("Upload a receipt image first.")
         with col2:
-            diesel_pdf = st.file_uploader("🧾 Diesel Receipt (PDF)", type="pdf", key="diesel_pdf")
+            diesel_img = st.file_uploader("🧾 Diesel Receipt (JPG/PNG)", type=["jpg","jpeg","png","webp"], key="diesel_img")
+            if diesel_img:
+                st.image(diesel_img, caption="Diesel receipt preview", use_container_width=True)
             if st.button("Extract Diesel Receipt", key="ext_diesel"):
-                if diesel_pdf:
-                    with st.spinner("Extracting..."):
-                        ext = extract_receipt_with_ai(diesel_pdf, "diesel fuel")
+                if diesel_img:
+                    with st.spinner("Reading receipt with AI vision..."):
+                        ext = extract_receipt_with_vision(diesel_img, "diesel fuel")
                     if "error" not in ext:
-                        st.session_state.s1_diesel_l = float(ext.get("litres") or 0)
-                        st.success(f"✅ {st.session_state.s1_diesel_l}L extracted")
+                        litres = float(ext.get("litres") or 0)
+                        st.session_state.s1_diesel_l = litres
+                        st.session_state["_toast_diesel"] = True
+                        st.rerun()
                     else:
-                        st.warning("Auto-extract failed. Enter manually.")
+                        st.warning(f"Extraction failed: {ext['error']}. Enter manually.")
                 else:
-                    st.warning("Upload PDF first.")
+                    st.warning("Upload a receipt image first.")
 
         c1, c2, c3 = st.columns(3)
         with c1:
             petrol_l = st.number_input("Petrol (litres)", min_value=0.0,
-                value=st.session_state.s1_petrol_l, step=1.0, key="petrol_l_in")
+                value=st.session_state.s1_petrol_l, step=1.0, key=f"petrol_l_in_{fk}")
         with c2:
             diesel_l = st.number_input("Diesel (litres)", min_value=0.0,
-                value=st.session_state.s1_diesel_l, step=1.0, key="diesel_l_in")
+                value=st.session_state.s1_diesel_l, step=1.0, key=f"diesel_l_in_{fk}")
         with c3:
-            lpg_kg = st.number_input("LPG (kg)", min_value=0.0, value=0.0, step=1.0)
+            lpg_kg = st.number_input("LPG (kg)", min_value=0.0, value=0.0, step=1.0, key=f"lpg_kg_{fk}")
 
         s1_kg = petrol_l*EF["petrol_litre"] + diesel_l*EF["diesel_litre"] + lpg_kg*EF["lpg_kg"]
         st.info(f"**Scope 1 Subtotal: {s1_kg/1000:.4f} t CO₂e**")
@@ -773,21 +846,24 @@ def render_carbon_calculator():
     # SCOPE 2 — Electricity
     # ════════════════════════════════════════
     with st.expander("🟡 SCOPE 2 — Indirect Emissions (Electricity)", expanded=True):
-        elec_pdf = st.file_uploader("🧾 Electricity Bill (PDF)", type="pdf", key="elec_pdf")
+        elec_img = st.file_uploader("🧾 Electricity Bill (JPG/PNG)", type=["jpg","jpeg","png","webp"], key="elec_img")
+        if elec_img:
+            st.image(elec_img, caption="Electricity bill preview", use_container_width=True)
         if st.button("Extract Electricity Bill", key="ext_elec"):
-            if elec_pdf:
-                with st.spinner("Extracting..."):
-                    ext = extract_receipt_with_ai(elec_pdf, "electricity bill")
+            if elec_img:
+                with st.spinner("Reading bill with AI vision..."):
+                    ext = extract_receipt_with_vision(elec_img, "electricity bill")
                 if "error" not in ext:
                     st.session_state.s2_kwh = float(ext.get("kwh") or 0)
-                    st.success(f"✅ {st.session_state.s2_kwh} kWh extracted")
+                    st.session_state["_toast_elec"] = True
+                    st.rerun()
                 else:
-                    st.warning("Auto-extract failed. Enter manually.")
+                    st.warning(f"Extraction failed: {ext['error']}. Enter manually.")
             else:
-                st.warning("Upload PDF first.")
+                st.warning("Upload a bill image first.")
 
         kwh = st.number_input("Electricity consumed (kWh)", min_value=0.0,
-            value=st.session_state.s2_kwh, step=10.0, key="kwh_in")
+            value=st.session_state.s2_kwh, step=10.0, key=f"kwh_in_{fk}")
         s2_kg = kwh * EF["electricity_kwh"]
         st.info(f"**Scope 2 Subtotal: {s2_kg/1000:.4f} t CO₂e**  "
                 f"(Malaysia grid: {EF['electricity_kwh']} kg CO₂e/kWh)")
@@ -796,9 +872,8 @@ def render_carbon_calculator():
     # SCOPE 3 — Logistics + Supplier Decision
     # ════════════════════════════════════════
     with st.expander("🟠 SCOPE 3 — Logistics & Supplier Carbon Decision", expanded=True):
-        st.markdown("**Select your supplier to auto-fill distance, or enter manually.**")
+        st.markdown("**Select your supplier to auto-fill distance, or upload a receipt image.**")
 
-        # FIX Q2: Supplier selector
         supplier_choice = st.selectbox(
             "Select Supplier / Route", list(DEFAULT_SUPPLIERS.keys()), key="supplier_sel")
         supplier_data = DEFAULT_SUPPLIERS[supplier_choice]
@@ -814,31 +889,35 @@ def render_carbon_calculator():
             auto_km   = 0.0
             auto_fuel = 0.0
 
-        # Receipt upload
-        log_pdf = st.file_uploader("🧾 Logistics Receipt (PDF, optional)", type="pdf", key="log_pdf")
+        # Receipt image upload
+        log_img = st.file_uploader("🧾 Logistics Receipt (JPG/PNG, optional)", type=["jpg","jpeg","png","webp"], key="log_img")
+        if log_img:
+            st.image(log_img, caption="Logistics receipt preview", use_container_width=True)
         if st.button("Extract Logistics Receipt", key="ext_log"):
-            if log_pdf:
-                with st.spinner("Extracting..."):
-                    ext = extract_receipt_with_ai(log_pdf, "logistics transport")
+            if log_img:
+                with st.spinner("Reading receipt with AI vision..."):
+                    ext = extract_receipt_with_vision(log_img, "logistics transport")
                 if "error" not in ext:
-                    st.session_state.s3_km       = float(ext.get("distance_km") or auto_km)
-                    st.session_state.s3_log_fuel = float(ext.get("fuel_litres") or auto_fuel)
-                    st.success(f"✅ {st.session_state.s3_km} km, {st.session_state.s3_log_fuel}L extracted")
+                    extracted_km   = float(ext.get("distance_km") or 0)
+                    extracted_fuel = float(ext.get("fuel_litres") or 0)
+                    st.session_state.s3_km       = extracted_km if extracted_km > 0 else auto_km
+                    st.session_state.s3_log_fuel = extracted_fuel if extracted_fuel > 0 else auto_fuel
+                    st.session_state["_toast_logistics"] = True
+                    st.rerun()
                 else:
-                    st.warning("Auto-extract failed. Using supplier auto-fill.")
+                    st.warning(f"Extraction failed: {ext['error']}. Using supplier auto-fill values.")
                     st.session_state.s3_km       = auto_km
                     st.session_state.s3_log_fuel = auto_fuel
             else:
-                st.session_state.s3_km       = auto_km
-                st.session_state.s3_log_fuel = auto_fuel
+                st.warning("Upload a logistics receipt image first.")
 
         c1, c2 = st.columns(2)
         with c1:
             log_km = st.number_input("Total logistics distance (km)", min_value=0.0,
-                value=float(st.session_state.s3_km or auto_km), step=10.0, key="log_km_in")
+                value=float(st.session_state.s3_km or auto_km), step=10.0, key=f"log_km_in_{fk}")
         with c2:
             log_diesel = st.number_input("Logistics diesel (litres)", min_value=0.0,
-                value=float(st.session_state.s3_log_fuel or auto_fuel), step=1.0, key="log_diesel_in")
+                value=float(st.session_state.s3_log_fuel or auto_fuel), step=1.0, key=f"log_diesel_in_{fk}")
 
         s3_kg = log_km*EF["logistics_km"] + log_diesel*EF["diesel_litre"]
         s3_tax_cost = (s3_kg/1000) * CARBON_TAX_RATE_RM
@@ -955,14 +1034,14 @@ def render_carbon_calculator():
         c1, c2 = st.columns(2)
         with c1:
             solid_kg   = st.number_input("🗑️ Solid waste (kg)",           min_value=0.0,
-                            value=st.session_state.waste_solid_kg, step=1.0, key="sw")
+                            value=st.session_state.waste_solid_kg, step=1.0, key=f"sw_{fk}")
             scrap_kg   = st.number_input("🔩 Scrap / off-cut metal (kg)", min_value=0.0,
-                            value=st.session_state.waste_scrap_kg, step=1.0, key="sm")
+                            value=st.session_state.waste_scrap_kg, step=1.0, key=f"sm_{fk}")
         with c2:
             ww_m3      = st.number_input("💧 Wastewater (m³)",            min_value=0.0,
-                            value=st.session_state.waste_ww_m3, step=0.1, key="ww")
+                            value=st.session_state.waste_ww_m3, step=0.1, key=f"ww_{fk}")
             general_kg = st.number_input("📦 General / other waste (kg)", min_value=0.0,
-                            value=st.session_state.waste_general_kg, step=1.0, key="gw")
+                            value=st.session_state.waste_general_kg, step=1.0, key=f"gw_{fk}")
 
         st.text_area("📝 Other waste (describe — for record keeping)",
             placeholder="e.g. Chemical solvent 20L, Packaging foam 50kg …", key="custom_waste")
@@ -1051,10 +1130,18 @@ Scope 1: `{r['scope1_t']*1000:.2f}` | Scope 2: `{r['scope2_t']*1000:.2f}` | Scop
         with col_c:
             if st.button("🗑️ Clear All Inputs", use_container_width=True):
                 for k in ["carbon_result", "carbon_supplier", "carbon_notes",
-                          "s1_petrol_l", "s1_diesel_l", "s2_kwh", "s3_km", "s3_log_fuel",
-                          "waste_solid_kg", "waste_scrap_kg", "waste_ww_m3", "waste_general_kg",
-                          "waste_ai_result"]:
+                          "s1_petrol_l", "s1_diesel_l", "s2_kwh",
+                          "s3_km", "s3_log_fuel",
+                          "waste_solid_kg", "waste_scrap_kg",
+                          "waste_ww_m3", "waste_general_kg", "waste_ai_result"]:
                     st.session_state.pop(k, None)
+                # Reset widget keys for current fk so they go back to 0
+                for wk in [f"petrol_l_in_{fk}", f"diesel_l_in_{fk}", f"lpg_kg_{fk}",
+                           f"kwh_in_{fk}", f"log_km_in_{fk}", f"log_diesel_in_{fk}",
+                           f"sw_{fk}", f"sm_{fk}", f"ww_{fk}", f"gw_{fk}"]:
+                    st.session_state.pop(wk, None)
+                # Force Streamlit to re-render all number_input widgets with fresh keys
+                st.session_state["calc_form_key"] = st.session_state.get("calc_form_key", 0) + 1
                 st.rerun()
 
     # ── Submission Report Files ──────────
