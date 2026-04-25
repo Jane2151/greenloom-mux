@@ -5,10 +5,13 @@ import sqlite3
 import pdfplumber
 from datetime import datetime
 from zhipuai import ZhipuAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- 1. CONFIG & ILMU-GLM API ---
 # CRITICAL: Use the specific API Key and Base URL provided in the guide
-Z_AI_API_KEY = "sk-2a2892ed6896d6a09783a960b81cd0d68df9040bde60a51a"
+Z_AI_API_KEY = os.environ.get("Z_AI_API_KEY", "")
 CUSTOM_BASE_URL = "https://api.ilmu.ai/v4"
 DB_NAME = "green_loom_production.db"
 
