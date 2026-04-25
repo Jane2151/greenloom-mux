@@ -23,12 +23,12 @@ os.makedirs(POLICY_FOLDER, exist_ok=True)
 SUBMISSION_REPORT_FOLDER = os.path.join(BASE_DIR, "submission_report")
 os.makedirs(SUBMISSION_REPORT_FOLDER, exist_ok=True)
 
-Z_AI_API_KEY   = "os.environ.get("Z_AI_API_KEY", "")"
+Z_AI_API_KEY   = os.environ.get("Z_AI_API_KEY", "")
 CUSTOM_BASE_URL = "https://api.ilmu.ai/v1"
 MODEL_NAME      = "ilmu-glm-5.1"
 
 # ── Groq Vision API (for Wastage Identify) ───
-GROQ_API_KEY    = "os.environ.get("GROQ_API_KEY", "")"
+GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
 GROQ_BASE_URL   = "https://api.groq.com/openai/v1"
 GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
