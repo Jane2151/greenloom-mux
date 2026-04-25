@@ -7,6 +7,7 @@ from datetime import datetime
 import requests
 import base64
 import re
+from fpdf import FPDF
 
 # ─────────────────────────────────────────────
 # 1. CONFIG
@@ -18,6 +19,9 @@ DATA_FILE = "chat_data.json"
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 POLICY_FOLDER = os.path.join(BASE_DIR, "knowledge_base")
 os.makedirs(POLICY_FOLDER, exist_ok=True)
+
+SUBMISSION_REPORT_FOLDER = os.path.join(BASE_DIR, "submission_report")
+os.makedirs(SUBMISSION_REPORT_FOLDER, exist_ok=True)
 
 Z_AI_API_KEY   = "os.environ.get("Z_AI_API_KEY", "")"
 CUSTOM_BASE_URL = "https://api.ilmu.ai/v1"
@@ -69,7 +73,15 @@ def init_db():
         energy_saving REAL, cost_advantage REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS knowledge_base (
         source TEXT, page_num INTEGER, content TEXT)''')
-    # FIX Q1: carbon_submissions is its own dedicated table
+    # Drop old carbon_submissions if schema is outdated, then recreate
+    c.execute("PRAGMA table_info(carbon_submissions)")
+    existing_cols = {row[1] for row in c.fetchall()}
+    expected_cols = {"id", "submitted_by", "submitted_at", "scope1_co2e", "scope2_co2e",
+                     "scope3_co2e", "scope3_logistics_co2e", "scope3_waste_co2e",
+                     "total_co2e", "taxable_co2e", "carbon_tax_rm", "offset_co2e",
+                     "net_tax_rm", "supplier_used", "notes"}
+    if existing_cols and not expected_cols.issubset(existing_cols):
+        c.execute("DROP TABLE carbon_submissions")
     c.execute('''CREATE TABLE IF NOT EXISTS carbon_submissions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         submitted_by TEXT,
@@ -77,7 +89,8 @@ def init_db():
         scope1_co2e REAL,
         scope2_co2e REAL,
         scope3_co2e REAL,
-        waste_co2e REAL,
+        scope3_logistics_co2e REAL,
+        scope3_waste_co2e REAL,
         total_co2e REAL,
         taxable_co2e REAL,
         carbon_tax_rm REAL,
@@ -86,7 +99,6 @@ def init_db():
         supplier_used TEXT,
         notes TEXT
     )''')
-    # FIX Q2: supplier carbon log
     c.execute('''CREATE TABLE IF NOT EXISTS supplier_carbon_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         logged_at TEXT,
@@ -369,6 +381,112 @@ def run_ai_analysis(user_message: str, conversation_history: list) -> str:
         return f"⚠️ AI Error: {str(e)}"
 
 
+def generate_chat_report(messages: list) -> str:
+    """Generate a report strictly from chat history — separate from the Carbon Tax Calculator.
+    Parses any quantities mentioned in chat, applies the same EF constants,
+    and computes carbon impact using the carbon tax formula."""
+    if not messages:
+        return "No chat data available to generate a report. Send some messages in the chat first."
+
+    chat_lines = []
+    for m in messages:
+        sender = m.get("sender", "Unknown")
+        text = m.get("text", "")
+        ts = m.get("timestamp") or m.get("time", "")
+        if text.strip():
+            chat_lines.append(f"[{ts}] {sender}: {text}")
+
+    if not chat_lines:
+        return "No meaningful chat content found to generate a report."
+
+    chat_text = "\n".join(chat_lines)
+
+    prompt = f"""You are GreenLoom AI - generating a Chat Report strictly from chat conversation data.
+
+CHAT HISTORY (most recent first):
+{chat_text}
+
+TASK: Analyse ONLY the chat data above. Do NOT reference any external calculator data.
+
+1. Summarise the key topics discussed.
+2. Extract any quantitative data mentioned (fuel litres, kWh, distance km, waste kg, etc.).
+3. For each extracted value, calculate CO2e using these emission factors:
+   - Petrol: {EF['petrol_litre']} kg CO2e/litre
+   - Diesel: {EF['diesel_litre']} kg CO2e/litre
+   - LPG: {EF['lpg_kg']} kg CO2e/kg
+   - Electricity: {EF['electricity_kwh']} kg CO2e/kWh
+   - Logistics distance: {EF['logistics_km']} kg CO2e/km
+   - Logistics diesel: {EF['diesel_litre']} kg CO2e/litre
+   - Solid waste: {EF['solid_waste_kg']} kg CO2e/kg
+   - Wastewater: {EF['wastewater_m3']} kg CO2e/m3
+   - Scrap metal: {EF['scrap_metal_kg']} kg CO2e/kg
+   - General waste: {EF['general_waste_kg']} kg CO2e/kg
+4. Sum all CO2e into total tonnes. Apply the Malaysian carbon tax:
+   - Free allowance: {FREE_ALLOWANCE_TONNES:,} tonnes
+   - Tax rate: RM {CARBON_TAX_RATE_RM}/tonne CO2e
+   - Taxable = max(0, total - {FREE_ALLOWANCE_TONNES:,})
+   - Tax payable = taxable x RM {CARBON_TAX_RATE_RM}
+5. For logistics consumption, compute:
+   - Logistics CO2e = (distance_km x {EF['logistics_km']}) + (diesel_litres x {EF['diesel_litre']})
+   - Logistics carbon tax = (logistics CO2e / 1000) x RM {CARBON_TAX_RATE_RM}
+6. Provide actionable recommendations.
+
+IMPORTANT: This report is based ONLY on chat conversation data. It is separate from the Carbon Tax Calculator manual entries.
+
+Format the report with clear sections and bullet points."""
+
+    api_payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": "You are GreenLoom AI, a sustainability analyst. Generate a detailed chat report based on the conversation data provided."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 4096
+    }
+
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                f"{CUSTOM_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {Z_AI_API_KEY}", "Content-Type": "application/json"},
+                json=api_payload,
+                timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+
+            choices = data.get("choices", [])
+            if not choices:
+                if attempt < 2:
+                    continue
+                return "API returned no choices. Please try again."
+
+            msg = choices[0].get("message", {})
+            content = msg.get("content") or ""
+            finish = choices[0].get("finish_reason", "")
+
+            if not content.strip():
+                if attempt < 2:
+                    continue
+                return f"AI returned an empty response (finish_reason: {finish}). Please try again."
+
+            if finish == "length":
+                content += "\n\n---\n*Report truncated due to length. Ask follow-up questions in chat for more detail.*"
+
+            return content
+
+        except requests.exceptions.HTTPError:
+            return f"HTTP Error {resp.status_code}: {resp.text}"
+        except requests.exceptions.Timeout:
+            if attempt < 2:
+                continue
+            return "AI request timed out after 3 attempts. Please try again."
+        except Exception as e:
+            if attempt < 2:
+                continue
+            return f"AI Error: {str(e)}"
+
+
 def get_supplier_ai_recommendation(supplier_log: list) -> str:
     """Ask AI to recommend the best supplier based on carbon + cost data."""
     if not supplier_log:
@@ -408,8 +526,9 @@ Provide a SHORT recommendation (max 150 words):
 # ─────────────────────────────────────────────
 # 6. CARBON TAX CALCULATOR
 # ─────────────────────────────────────────────
-def calculate_carbon_tax(scope1, scope2, scope3, waste, offset_t):
-    total_kg  = scope1 + scope2 + scope3 + waste
+def calculate_carbon_tax(scope1, scope2, scope3_logistics, scope3_waste, offset_t):
+    scope3 = scope3_logistics + scope3_waste
+    total_kg  = scope1 + scope2 + scope3
     total_t   = total_kg / 1000.0
     net_t     = max(0, total_t - offset_t)
     taxable_t = max(0, net_t - FREE_ALLOWANCE_TONNES)
@@ -419,7 +538,8 @@ def calculate_carbon_tax(scope1, scope2, scope3, waste, offset_t):
         "scope1_t":  scope1 / 1000,
         "scope2_t":  scope2 / 1000,
         "scope3_t":  scope3 / 1000,
-        "waste_t":   waste  / 1000,
+        "scope3_logistics_t": scope3_logistics / 1000,
+        "scope3_waste_t":     scope3_waste / 1000,
         "total_t":   total_t,
         "offset_t":  offset_t,
         "net_t":     net_t,
@@ -437,12 +557,13 @@ def save_carbon_submission(result: dict, supplier_name: str, notes: str):
     c = conn.cursor()
     c.execute("""INSERT INTO carbon_submissions
         (submitted_by, submitted_at, scope1_co2e, scope2_co2e, scope3_co2e,
-         waste_co2e, total_co2e, taxable_co2e, carbon_tax_rm,
+         scope3_logistics_co2e, scope3_waste_co2e, total_co2e, taxable_co2e, carbon_tax_rm,
          offset_co2e, net_tax_rm, supplier_used, notes)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
         st.session_state.user, datetime.now().isoformat(),
         result["scope1_t"], result["scope2_t"],
-        result["scope3_t"], result["waste_t"],
+        result["scope3_t"], result["scope3_logistics_t"],
+        result["scope3_waste_t"],
         result["total_t"],  result["taxable_t"],
         result["tax_rm"],   result["offset_t"],
         result["net_tax_rm"], supplier_name, notes
@@ -475,6 +596,114 @@ def get_supplier_log_summary():
     rows = c.fetchall()
     conn.close()
     return rows
+
+
+def generate_submission_pdf(result: dict, supplier_name: str, notes: str) -> str:
+    """Generate a PDF report of the carbon tax breakdown and save to submission_report folder."""
+    def _safe(text):
+        return text.replace("—", "--").replace("–", "-").replace("‘", "'").replace("’", "'").replace("“", '"').replace("”", '"').replace("…", "...").replace("•", "-").replace("²", "2")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"carbon_tax_report_{ts}.pdf"
+    filepath = os.path.join(SUBMISSION_REPORT_FOLDER, filename)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 12, "GreenLoom Carbon Tax Report", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, _safe(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"), ln=True, align="C")
+    pdf.cell(0, 6, _safe(f"Submitted by: {st.session_state.user} ({st.session_state.role})"), ln=True, align="C")
+    pdf.ln(4)
+    pdf.set_draw_color(0, 128, 0)
+    pdf.set_line_width(0.5)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(6)
+
+    # Emissions Breakdown
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "Emissions Breakdown", ln=True)
+    pdf.set_font("Helvetica", "", 10)
+
+    breakdown = [
+        ("Scope 1 - Direct Emissions (Fuel)", f"{result['scope1_t']:.3f} t CO2e"),
+        ("Scope 2 - Indirect Emissions (Electricity)", f"{result['scope2_t']:.3f} t CO2e"),
+        ("Scope 3 - Logistics", f"{result['scope3_logistics_t']:.3f} t CO2e"),
+        ("Scope 3 - Waste Generated in Operations", f"{result['scope3_waste_t']:.3f} t CO2e"),
+    ]
+    for label, val in breakdown:
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(120, 7, _safe(f"  {label}"))
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 7, _safe(val), ln=True)
+
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(120, 7, "  Total Emissions")
+    pdf.cell(0, 7, _safe(f"{result['total_t']:.3f} t CO2e"), ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(120, 7, "  Offsets Applied")
+    pdf.cell(0, 7, _safe(f"- {result['offset_t']:.3f} t"), ln=True)
+    pdf.cell(120, 7, "  Net Emissions")
+    pdf.cell(0, 7, _safe(f"{result['net_t']:.3f} t CO2e"), ln=True)
+    pdf.ln(6)
+
+    # Carbon Tax Calculation
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "Carbon Tax Calculation", ln=True)
+    pdf.set_font("Helvetica", "", 10)
+
+    tax_rows = [
+        ("Free Allowance", f"{result['allowance_t']:,} t"),
+        ("Net Emissions after Offsets", f"{result['net_t']:.3f} t"),
+        ("Taxable Emissions", f"{result['taxable_t']:.3f} t"),
+        ("Tax Rate", f"RM {result['tax_rate']:.0f}/tonne"),
+        ("Gross Carbon Tax", f"RM {result['tax_rm']:,.2f}"),
+        ("Offset Cost", f"RM {result['offset_cost_rm']:,.2f}"),
+        ("NET TAX PAYABLE", f"RM {result['net_tax_rm']:,.2f}"),
+    ]
+    for label, val in tax_rows:
+        pdf.cell(120, 7, _safe(f"  {label}"))
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 7, _safe(val), ln=True)
+        pdf.set_font("Helvetica", "", 10)
+    pdf.ln(6)
+
+    # Calculation Steps
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "Calculation Steps", ln=True)
+    pdf.set_font("Helvetica", "", 9)
+    steps = [
+        "Step 1: Activity x Emission Factor (kg CO2e)",
+        _safe(f"  Scope 1: {result['scope1_t']*1000:.2f} | Scope 2: {result['scope2_t']*1000:.2f} | Scope 3 Logistics: {result['scope3_logistics_t']*1000:.2f} | Scope 3 Waste: {result['scope3_waste_t']*1000:.2f}"),
+        _safe(f"  Total: {result['total_t']:.4f} tonnes"),
+        _safe(f"Step 2: Deduct Offsets: {result['total_t']:.4f} - {result['offset_t']:.4f} = {result['net_t']:.4f} t"),
+        _safe(f"Step 3: Free Allowance: max(0, {result['net_t']:.4f} - {result['allowance_t']:,}) = {result['taxable_t']:.4f} t taxable"),
+        _safe(f"Step 4: Apply Tax Rate: {result['taxable_t']:.4f} x RM {result['tax_rate']} = RM {result['tax_rm']:,.2f}"),
+        _safe(f"Step 5: Deduct Offset Cost: RM {result['tax_rm']:,.2f} - RM {result['offset_cost_rm']:,.2f} = RM {result['net_tax_rm']:,.2f}"),
+    ]
+    for step in steps:
+        pdf.cell(0, 5, _safe(step), ln=True)
+    pdf.ln(6)
+
+    # Supplier & Notes
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "Additional Info", ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 7, _safe(f"  Supplier: {supplier_name}"), ln=True)
+    pdf.cell(0, 7, _safe(f"  Notes: {notes or '-'}"), ln=True)
+    pdf.ln(8)
+
+    # Footer
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.cell(0, 5, "This report was generated by GreenLoom Carbon Tax Calculator.", ln=True, align="C")
+    pdf.cell(0, 5, "Malaysian Carbon Capture, Utilisation and Storage Act 2025.", ln=True, align="C")
+
+    pdf.output(filepath)
+    return filepath
 
 
 def render_carbon_calculator():
@@ -564,7 +793,7 @@ def render_carbon_calculator():
     # ════════════════════════════════════════
     # SCOPE 3 — Logistics + Supplier Decision
     # ════════════════════════════════════════
-    with st.expander("🟠 SCOPE 3 — Logistics & Supplier Carbon Decision (Q2 Fix)", expanded=True):
+    with st.expander("🟠 SCOPE 3 — Logistics & Supplier Carbon Decision", expanded=True):
         st.markdown("**Select your supplier to auto-fill distance, or enter manually.**")
 
         # FIX Q2: Supplier selector
@@ -612,7 +841,7 @@ def render_carbon_calculator():
         s3_kg = log_km*EF["logistics_km"] + log_diesel*EF["diesel_litre"]
         s3_tax_cost = (s3_kg/1000) * CARBON_TAX_RATE_RM
 
-        st.info(f"**Scope 3 Subtotal: {s3_kg/1000:.4f} t CO₂e**  |  "
+        st.info(f"**Scope 3 Logistics Subtotal: {s3_kg/1000:.4f} t CO₂e**  |  "
                 f"Estimated carbon tax cost: **RM {s3_tax_cost:.2f}**")
 
         # Log this supplier trip
@@ -646,77 +875,81 @@ def render_carbon_calculator():
             st.caption("No supplier trips logged yet. Log a trip above to start comparing.")
 
     # ════════════════════════════════════════
-    # WASTAGE IDENTIFY (Groq Vision AI)
+    # SCOPE 3 — Waste Generated in Operations (Category 5)
     # ════════════════════════════════════════
     for wk, wv in [("waste_solid_kg", 0.0), ("waste_scrap_kg", 0.0),
                     ("waste_ww_m3", 0.0), ("waste_general_kg", 0.0)]:
         if wk not in st.session_state:
             st.session_state[wk] = wv
 
-    with st.expander("🔍 WASTAGE IDENTIFY — AI Vision Weight Estimator", expanded=False):
-        st.markdown("**Upload a photo of waste and AI will identify the type & estimate the weight.**")
-        st.caption("Powered by Groq Llama 3.2 Vision. Supports JPG, PNG, WEBP images.")
+    with st.expander("⚫ SCOPE 3 — Waste Generated in Operations (Category 5)", expanded=True):
+        st.caption("GHG Protocol Scope 3 Category 5: Disposal & treatment of waste generated. "
+                    "Emission factors: Solid 0.5 | Wastewater 0.42/m³ | Scrap metal 1.46 | General 0.5 kg CO₂e/kg")
 
-        waste_img = st.file_uploader(
-            "📸 Upload waste photo",
-            type=["jpg", "jpeg", "png", "webp", "gif"],
-            key="waste_image_uploader"
-        )
+        # ── Wastage Identify (Groq Vision AI) ────
+        with st.container():
+            st.markdown("##### 🔍 Wastage Identify — AI Vision Weight Estimator")
+            st.caption("Upload a photo of waste and AI will identify the type & estimate the weight. Powered by Groq Vision.")
 
-        if waste_img:
-            st.image(waste_img, caption="Uploaded waste image", use_container_width=True)
+            waste_img = st.file_uploader(
+                "📸 Upload waste photo",
+                type=["jpg", "jpeg", "png", "webp", "gif"],
+                key="waste_image_uploader"
+            )
 
-        if st.button("🤖 Identify Wastage with AI", key="identify_waste_btn"):
             if waste_img:
-                with st.spinner("Groq AI is analysing the waste image..."):
-                    result = identify_wastage_with_ai(waste_img)
-                if "error" not in result:
-                    st.session_state["waste_ai_result"] = result
+                st.image(waste_img, caption="Uploaded waste image", use_container_width=True)
 
-                    waste_type = result.get("waste_type", "general_waste")
-                    weight = float(result.get("estimated_weight_kg", 0))
-                    confidence = result.get("confidence_percent", 50)
-                    description = result.get("description", "—")
-                    details = result.get("material_details", "—")
-                    label = result.get("waste_type_label", "Unknown")
+            if st.button("🤖 Identify Wastage with AI", key="identify_waste_btn"):
+                if waste_img:
+                    with st.spinner("Groq AI is analysing the waste image..."):
+                        result = identify_wastage_with_ai(waste_img)
+                    if "error" not in result:
+                        st.session_state["waste_ai_result"] = result
 
-                    if waste_type == "solid_waste":
-                        st.session_state.waste_solid_kg = weight
-                    elif waste_type == "scrap_metal":
-                        st.session_state.waste_scrap_kg = weight
-                    elif waste_type == "wastewater":
-                        st.session_state.waste_ww_m3 = weight
+                        waste_type = result.get("waste_type", "general_waste")
+                        weight = float(result.get("estimated_weight_kg", 0))
+                        confidence = result.get("confidence_percent", 50)
+                        description = result.get("description", "—")
+                        details = result.get("material_details", "—")
+                        label = result.get("waste_type_label", "Unknown")
+
+                        if waste_type == "solid_waste":
+                            st.session_state.waste_solid_kg = weight
+                        elif waste_type == "scrap_metal":
+                            st.session_state.waste_scrap_kg = weight
+                        elif waste_type == "wastewater":
+                            st.session_state.waste_ww_m3 = weight
+                        else:
+                            st.session_state.waste_general_kg = weight
+
+                        conf_color = "green" if confidence >= 70 else "orange" if confidence >= 40 else "red"
+                        st.success(f"✅ Identified: **{label}** — estimated **{weight:.1f} kg**")
+                        st.markdown(f"**Confidence:** :{conf_color}[**{confidence}%**]")
+                        st.info(f"**Description:** {description}\n\n**Materials:** {details}")
+
+                        if confidence < 40:
+                            st.warning("⚠️ Low confidence — please verify the weight manually.")
                     else:
-                        st.session_state.waste_general_kg = weight
-
-                    conf_color = "green" if confidence >= 70 else "orange" if confidence >= 40 else "red"
-                    st.success(f"✅ Identified: **{label}** — estimated **{weight:.1f} kg**")
-                    st.markdown(f"**Confidence:** :{conf_color}[**{confidence}%**]")
-                    st.info(f"**Description:** {description}\n\n**Materials:** {details}")
-
-                    if confidence < 40:
-                        st.warning("⚠️ Low confidence — please verify the weight manually.")
+                        st.error(f"❌ {result['error']}")
                 else:
-                    st.error(f"❌ {result['error']}")
-            else:
-                st.warning("Please upload a waste image first.")
+                    st.warning("Please upload a waste image first.")
 
-        if "waste_ai_result" in st.session_state:
-            r = st.session_state["waste_ai_result"]
-            with st.container():
-                st.markdown("**📋 Last AI Identification:**")
-                st.markdown(f"- **Type:** {r.get('waste_type_label', '—')}")
-                st.markdown(f"- **Estimated Weight:** {r.get('estimated_weight_kg', 0)} kg")
-                conf = r.get('confidence_percent', 50)
-                conf_color = "green" if conf >= 70 else "orange" if conf >= 40 else "red"
-                st.markdown(f"- **Confidence:** :{conf_color}[**{conf}%**]")
-                st.markdown(f"- **Details:** {r.get('material_details', '—')}")
+            if "waste_ai_result" in st.session_state:
+                r = st.session_state["waste_ai_result"]
+                with st.container():
+                    st.markdown("**📋 Last AI Identification:**")
+                    st.markdown(f"- **Type:** {r.get('waste_type_label', '—')}")
+                    st.markdown(f"- **Estimated Weight:** {r.get('estimated_weight_kg', 0)} kg")
+                    conf = r.get('confidence_percent', 50)
+                    conf_color = "green" if conf >= 70 else "orange" if conf >= 40 else "red"
+                    st.markdown(f"- **Confidence:** :{conf_color}[**{conf}%**]")
+                    st.markdown(f"- **Details:** {r.get('material_details', '—')}")
 
-    # ════════════════════════════════════════
-    # WASTE
-    # ════════════════════════════════════════
-    with st.expander("⚫ WASTE EMISSIONS (All Types)", expanded=True):
-        st.caption("Emission factors: Solid 0.5 | Wastewater 0.42/m³ | Scrap metal 1.46 | General 0.5 kg CO₂e/kg")
+        st.divider()
+
+        # ── Manual waste input ────
+        st.markdown("##### 🗑️ Waste Quantities (manually adjust AI-identified values)")
         c1, c2 = st.columns(2)
         with c1:
             solid_kg   = st.number_input("🗑️ Solid waste (kg)",           min_value=0.0,
@@ -734,7 +967,7 @@ def render_carbon_calculator():
 
         waste_kg = (solid_kg*EF["solid_waste_kg"] + ww_m3*EF["wastewater_m3"] +
                     scrap_kg*EF["scrap_metal_kg"] + general_kg*EF["general_waste_kg"])
-        st.info(f"**Waste Subtotal: {waste_kg/1000:.4f} t CO₂e**")
+        st.info(f"**Scope 3 Waste Subtotal: {waste_kg/1000:.4f} t CO₂e**")
 
     # ════════════════════════════════════════
     # OFFSETS
@@ -765,11 +998,11 @@ def render_carbon_calculator():
         st.divider()
         st.subheader("📊 Carbon Tax Breakdown")
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("🔴 Scope 1", f"{r['scope1_t']:.3f} t")
         c2.metric("🟡 Scope 2", f"{r['scope2_t']:.3f} t")
         c3.metric("🟠 Scope 3", f"{r['scope3_t']:.3f} t")
-        c4.metric("⚫ Waste",   f"{r['waste_t']:.3f} t")
+        st.caption(f"↳ Scope 3 breakdown — Logistics: {r['scope3_logistics_t']:.3f} t  |  Waste: {r['scope3_waste_t']:.3f} t")
         st.markdown("---")
 
         c5, c6, c7 = st.columns(3)
@@ -793,7 +1026,7 @@ def render_carbon_calculator():
         with st.expander("🔍 Calculation Steps"):
             st.markdown(f"""
 **Step 1 — Activity × Emission Factor (kg CO₂e):**
-Scope 1: `{r['scope1_t']*1000:.2f}` | Scope 2: `{r['scope2_t']*1000:.2f}` | Scope 3: `{r['scope3_t']*1000:.2f}` | Waste: `{r['waste_t']*1000:.2f}`
+Scope 1: `{r['scope1_t']*1000:.2f}` | Scope 2: `{r['scope2_t']*1000:.2f}` | Scope 3 (Logistics): `{r['scope3_logistics_t']*1000:.2f}` | Scope 3 (Waste): `{r['scope3_waste_t']*1000:.2f}`
 → **Total: {r['total_t']:.4f} tonnes**
 
 **Step 2 — Deduct Offsets:** {r['total_t']:.4f} − {r['offset_t']:.4f} = **{r['net_t']:.4f} t**
@@ -808,42 +1041,63 @@ Scope 1: `{r['scope1_t']*1000:.2f}` | Scope 2: `{r['scope2_t']*1000:.2f}` | Scop
         col_s, col_c = st.columns(2)
         with col_s:
             if st.button("💾 Save Submission", use_container_width=True):
-                save_carbon_submission(
-                    r,
-                    st.session_state.get("carbon_supplier", "—"),
-                    st.session_state.get("carbon_notes", "")
-                )
-                st.success("✅ Saved to database.")
+                supplier = st.session_state.get("carbon_supplier", "—")
+                notes = st.session_state.get("carbon_notes", "")
+                save_carbon_submission(r, supplier, notes)
+                pdf_path = generate_submission_pdf(r, supplier, notes)
+                st.success(f"✅ Saved to database.\n📄 Report: `{os.path.basename(pdf_path)}`")
         with col_c:
-            if st.button("🗑️ Clear", use_container_width=True):
-                del st.session_state["carbon_result"]
+            if st.button("🗑️ Clear All Inputs", use_container_width=True):
+                for k in ["carbon_result", "carbon_supplier", "carbon_notes",
+                          "s1_petrol_l", "s1_diesel_l", "s2_kwh", "s3_km", "s3_log_fuel",
+                          "waste_solid_kg", "waste_scrap_kg", "waste_ww_m3", "waste_general_kg",
+                          "waste_ai_result"]:
+                    st.session_state.pop(k, None)
                 st.rerun()
 
-    # Past submissions (CEO only)
-    if st.session_state.role == "CEO":
-        st.divider()
-        st.subheader("📋 Past Submissions")
-        try:
-            conn = sqlite3.connect(DB_NAME)
-            c = conn.cursor()
-            c.execute("""SELECT submitted_by, submitted_at, total_co2e,
-                                taxable_co2e, net_tax_rm, supplier_used, notes
-                         FROM carbon_submissions ORDER BY submitted_at DESC LIMIT 10""")
-            rows = c.fetchall()
-            conn.close()
-            if rows:
-                st.table([{
-                    "By": r[0], "Date": r[1][:16],
-                    "Total CO₂e (t)": f"{r[2]:.3f}",
-                    "Taxable (t)":    f"{r[3]:.3f}",
-                    "Net Tax (RM)":   f"{r[4]:,.2f}",
-                    "Supplier":       r[5] or "—",
-                    "Notes":          r[6] or "—"
-                } for r in rows])
-            else:
-                st.caption("No submissions yet.")
-        except Exception as e:
-            st.caption(f"Could not load history: {e}")
+    # ── Submission Report Files ──────────
+    st.divider()
+    st.subheader("📄 Submission Reports")
+    pdf_files = sorted(
+        [f for f in os.listdir(SUBMISSION_REPORT_FOLDER) if f.lower().endswith(".pdf")],
+        reverse=True
+    )
+    if pdf_files:
+        for pf in pdf_files:
+            fp = os.path.join(SUBMISSION_REPORT_FOLDER, pf)
+            fc1, fc2, fc3 = st.columns([5, 1, 1])
+            with fc1:
+                st.markdown(f"📄 **{pf}**")
+            with fc2:
+                with open(fp, "rb") as f:
+                    st.download_button(
+                        "📥 Download",
+                        data=f.read(),
+                        file_name=pf,
+                        mime="application/pdf",
+                        key=f"dl_{pf}"
+                    )
+            with fc3:
+                if st.button("🗑️", key=f"del_{pf}", help=f"Delete {pf}"):
+                    st.session_state[f"confirm_del_{pf}"] = True
+                    st.rerun()
+
+            # Confirmation dialog
+            if st.session_state.get(f"confirm_del_{pf}", False):
+                st.warning(f"⚠️ Are you sure you want to delete **{pf}**? This cannot be undone.")
+                bc1, bc2 = st.columns(2)
+                with bc1:
+                    if st.button("✅ Confirm Delete", key=f"yes_{pf}"):
+                        os.remove(fp)
+                        st.session_state.pop(f"confirm_del_{pf}", None)
+                        st.success(f"Deleted {pf}")
+                        st.rerun()
+                with bc2:
+                    if st.button("❌ Cancel", key=f"no_{pf}"):
+                        st.session_state.pop(f"confirm_del_{pf}", None)
+                        st.rerun()
+    else:
+        st.caption("No PDF reports generated yet. Save a submission to create one.")
 
 # ─────────────────────────────────────────────
 # 7. AUTH
@@ -875,8 +1129,7 @@ data = load_data()
 for key, default in [
     ("user", None), ("role", None),
     ("show_report", False), ("current_report", ""),
-    ("show_policy", False), ("show_carbon", False),
-    ("show_wastage", False)
+    ("show_policy", False), ("show_carbon", False)
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -912,44 +1165,34 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+
+    # Chat Report — CEO only, above Carbon Tax Calculator
+    if st.session_state.role == "CEO":
+        st.subheader("📊 Chat Report")
+        if st.button("Generate Chat Report", use_container_width=True):
+            with st.spinner("Analysing chat data..."):
+                history = data["messages"][-10:]
+                st.session_state.current_report = generate_chat_report(history)
+                st.session_state.show_report = True
+                st.session_state.show_policy = False
+                st.session_state.show_carbon = False
+            st.rerun()
+
+    st.divider()
     # CEO + Manager can access Carbon Calculator
     if st.button("🌿 Carbon Tax Calculator", use_container_width=True):
         st.session_state.show_carbon = True
-        st.session_state.show_report = False
-        st.session_state.show_policy = False
-        st.session_state.show_wastage = False
-        st.rerun()
-
-    if st.button("🔍 Wastage Identify", use_container_width=True):
-        st.session_state.show_wastage = True
-        st.session_state.show_carbon = False
         st.session_state.show_report = False
         st.session_state.show_policy = False
         st.rerun()
 
     if st.session_state.role == "CEO":
         st.divider()
-        st.subheader("📊 AI Reports")
-        if st.button("Generate AI Report", use_container_width=True):
-            with st.spinner("Analysing..."):
-                history  = data["messages"][-10:]
-                last_msg = next(
-                    (m["text"] for m in reversed(history) if m["sender"] != "AI"),
-                    "Provide a full sustainability and compliance summary.")
-                st.session_state.current_report = run_ai_analysis(last_msg, history)
-                st.session_state.show_report = True
-                st.session_state.show_policy = False
-                st.session_state.show_carbon = False
-                st.session_state.show_wastage = False
-            st.rerun()
-
-        st.divider()
         st.subheader("📂 Policy Management")
         if st.button("📥 Open Policy Upload Panel", use_container_width=True):
             st.session_state.show_policy = True
             st.session_state.show_report = False
             st.session_state.show_carbon = False
-            st.session_state.show_wastage = False
             st.rerun()
 
         st.divider()
@@ -977,104 +1220,6 @@ with st.sidebar:
 # VIEW A — Carbon Calculator (CEO + Manager)
 if st.session_state.show_carbon:
     render_carbon_calculator()
-
-# VIEW A2 — Wastage Identify (CEO + Manager)
-elif st.session_state.show_wastage:
-    st.title("🔍 Wastage Identify — AI Vision Weight Estimator")
-    st.caption("Upload a photo of waste and Groq AI will identify the type & estimate the weight.")
-
-    if st.button("← Back to Chat"):
-        st.session_state.show_wastage = False
-        st.rerun()
-
-    st.divider()
-
-    for wk, wv in [("waste_solid_kg", 0.0), ("waste_scrap_kg", 0.0),
-                    ("waste_ww_m3", 0.0), ("waste_general_kg", 0.0)]:
-        if wk not in st.session_state:
-            st.session_state[wk] = wv
-
-    waste_img = st.file_uploader(
-        "📸 Upload waste photo",
-        type=["jpg", "jpeg", "png", "webp", "gif"],
-        key="waste_img_standalone"
-    )
-
-    if waste_img:
-        st.image(waste_img, caption="Uploaded waste image", use_container_width=True)
-
-    if st.button("🤖 Identify Wastage with AI", key="identify_waste_standalone", use_container_width=True, type="primary"):
-        if waste_img:
-            with st.spinner("Groq AI is analysing the waste image..."):
-                result = identify_wastage_with_ai(waste_img)
-            if "error" not in result:
-                st.session_state["waste_ai_result"] = result
-
-                waste_type = result.get("waste_type", "general_waste")
-                weight = float(result.get("estimated_weight_kg", 0))
-                confidence = result.get("confidence_percent", 50)
-                description = result.get("description", "—")
-                details = result.get("material_details", "—")
-                label = result.get("waste_type_label", "Unknown")
-                reasoning = result.get("estimation_reasoning", "—")
-
-                if waste_type == "solid_waste":
-                    st.session_state.waste_solid_kg = weight
-                elif waste_type == "scrap_metal":
-                    st.session_state.waste_scrap_kg = weight
-                elif waste_type == "wastewater":
-                    st.session_state.waste_ww_m3 = weight
-                else:
-                    st.session_state.waste_general_kg = weight
-
-                conf_color = "green" if confidence >= 70 else "orange" if confidence >= 40 else "red"
-                st.success(f"✅ Identified: **{label}** — estimated **{weight:.1f} kg**")
-                st.markdown(f"**Confidence:** :{conf_color}[**{confidence}%**]")
-                st.info(f"**Description:** {description}\n\n**Materials:** {details}\n\n**Reasoning:** {reasoning}")
-
-                if confidence < 40:
-                    st.warning("⚠️ Low confidence — please verify the weight manually.")
-
-                # Calculate carbon impact
-                ef_key = {
-                    "solid_waste": "solid_waste_kg",
-                    "scrap_metal": "scrap_metal_kg",
-                    "wastewater": "wastewater_m3",
-                    "general_waste": "general_waste_kg",
-                }.get(waste_type, "general_waste_kg")
-                co2e_kg = weight * EF[ef_key]
-                tax_rm = (co2e_kg / 1000) * CARBON_TAX_RATE_RM
-
-                st.divider()
-                st.subheader("📊 Carbon Impact Estimate")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Estimated Weight", f"{weight:.1f} kg")
-                c2.metric("CO₂e Emissions", f"{co2e_kg:.2f} kg ({co2e_kg/1000:.4f} t)")
-                c3.metric("Carbon Tax Cost", f"RM {tax_rm:.2f}")
-            else:
-                st.error(f"❌ {result['error']}")
-        else:
-            st.warning("Please upload a waste image first.")
-
-    # Show last AI result
-    if "waste_ai_result" in st.session_state:
-        r = st.session_state["waste_ai_result"]
-        st.divider()
-        st.subheader("📋 Last AI Identification")
-        st.markdown(f"- **Type:** {r.get('waste_type_label', '—')}")
-        st.markdown(f"- **Estimated Weight:** {r.get('estimated_weight_kg', 0)} kg")
-        conf = r.get('confidence_percent', 50)
-        conf_color = "green" if conf >= 70 else "orange" if conf >= 40 else "red"
-        st.markdown(f"- **Confidence:** :{conf_color}[**{conf}%**]")
-        st.markdown(f"- **Description:** {r.get('description', '—')}")
-        st.markdown(f"- **Materials:** {r.get('material_details', '—')}")
-
-    # Link to Carbon Tax Calculator
-    st.divider()
-    if st.button("🌿 Open Carbon Tax Calculator to apply wastage data", use_container_width=True):
-        st.session_state.show_carbon = True
-        st.session_state.show_wastage = False
-        st.rerun()
 
 # VIEW B — Policy Upload (CEO only)
 elif st.session_state.show_policy and st.session_state.role == "CEO":
@@ -1108,10 +1253,10 @@ elif st.session_state.show_policy and st.session_state.role == "CEO":
         st.success(result)
         st.rerun()
 
-# VIEW C — AI Report (CEO only)
+# VIEW C — Chat Report (CEO only)
 elif st.session_state.show_report and st.session_state.role == "CEO":
-    st.title("📊 AI Analysis Report")
-    st.caption(f"Generated at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    st.title("📊 Chat Report")
+    st.caption(f"Based on chat data only — Generated at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     if st.button("← Back to Chat"):
         st.session_state.show_report = False
         st.rerun()
