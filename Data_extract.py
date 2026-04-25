@@ -11,8 +11,8 @@ load_dotenv()
 
 # --- 1. CONFIG & ILMU-GLM API ---
 # CRITICAL: Use the specific API Key and Base URL provided in the guide
-Z_AI_API_KEY = os.environ.get("Z_AI_API_KEY", "")
-CUSTOM_BASE_URL = "https://api.ilmu.ai/v4"
+Z_AI_API_KEY = st.secrets.get("Z_AI_API_KEY", os.environ.get("Z_AI_API_KEY", ""))
+CUSTOM_BASE_URL = st.secrets.get("CUSTOM_BASE_URL", os.environ.get("CUSTOM_BASE_URL", "https://api.ilmu.ai/v4"))
 DB_NAME = "green_loom_production.db"
 
 # Initialize the client specifically for the hackathon endpoint
