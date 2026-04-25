@@ -1,3 +1,6 @@
-pdfplumber
 streamlit
+pdfplumber
 fpdf
+requests
+python-dotenv
+zhipuai
