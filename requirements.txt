@@ -4,3 +4,4 @@ fpdf
 requests
 python-dotenv
 zhipuai
+plotly
